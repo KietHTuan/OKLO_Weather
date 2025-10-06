@@ -4,7 +4,8 @@ numpy
 matplotlib
 seaborn
 streamlit_searchbox
-requests
+
 streamlit_folium
-xgboost 
+ 
+
 
