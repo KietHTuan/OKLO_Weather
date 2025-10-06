@@ -626,7 +626,7 @@ def load_model(path: str):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-model = load_model(r"D:\Oklo_weather_prediction\Models\XGB_Classifier.pkl")
+model = load_model(r"D:\Oklo_weather_prediction\XGB_Classifier.pkl")
 
 # --- Get month from user or use date ---
 default_month = st.session_state["chosen_date"].month
@@ -717,4 +717,5 @@ if rain_total and rain_total > 5:
     recommendation += " Recent rainfall suggests continued moisture in the area."
 
 st.markdown(f"**Recommendation:** {recommendation}")
+
 
