@@ -10,7 +10,7 @@ from streamlit_searchbox import st_searchbox
 from streamlit_folium import st_folium
 import folium
 import os
-import xgboost as xgb
+
 
 # --- Page Setup ---
 st.set_page_config(page_title="OKLO - Weather Prediciton", page_icon="⛅", layout="centered")
@@ -721,6 +721,7 @@ if rain_total and rain_total > 5:
     recommendation += " Recent rainfall suggests continued moisture in the area."
 
 st.markdown(f"**Recommendation:** {recommendation}")
+
 
 
 
