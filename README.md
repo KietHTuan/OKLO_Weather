@@ -23,3 +23,6 @@ We aim to analyze multiple environmental parameters to classify different types 
 ## 🧠 Machine Learning Objective
 This is a **multi-categorical classification problem** where the model predicts weather pattern categories Sunny, Rainy, Snowy
 
+
+## Limitations 
+The model precision only 82% there are more room for imporvement in future feature engineering process
