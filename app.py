@@ -238,379 +238,6 @@ with st.expander("📍 Location preview", expanded=True):
     else:
         st.info("Pick a location first to see the map.")
 
-# =========================
-# SECTION 2 — Fetch & Summarize Weather (smart intervals + accurate "current")
-# =========================
-import requests
-import pandas as pd
-import numpy as np
-from typing import Optional, Dict, List, Tuple
-from datetime import datetime, timezone
-
-FETCH_TIMEOUT = 20  # seconds
-
-# --- small helpers ---
-def iso_z(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def get_meteomatics_creds() -> (str, str):
-    # expects .streamlit/secrets.toml:
-    # [meteomatics]
-    # username = "..."
-    # password = "..."
-    if "meteomatics" in st.secrets:
-        u = st.secrets["meteomatics"].get("username")
-        p = st.secrets["meteomatics"].get("password")
-        if u and p:
-            return u, p
-    st.error("Missing Meteomatics credentials in .streamlit/secrets.toml under [meteomatics].")
-    st.stop()
-
-def try_fetch_interval(lat: float, lon: float, start_utc: datetime, end_utc: datetime,
-                       interval: str, params: List[str]) -> Optional[pd.DataFrame]:
-    """Try a specific interval like PT15M / PT1H; return df or None."""
-    API_USERNAME, API_PASSWORD = get_meteomatics_creds()
-    url = f"https://api.meteomatics.com/{iso_z(start_utc)}--{iso_z(end_utc)}:{interval}/{','.join(params)}/{lat},{lon}/json"
-    r = requests.get(url, auth=(API_USERNAME, API_PASSWORD), timeout=FETCH_TIMEOUT)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        return None
-    rows = {}
-    for p in data:
-        param = p["parameter"]
-        coords = p["coordinates"][0]
-        for d in coords["dates"]:
-            ts = d["date"]; val = d.get("value")
-            rows.setdefault(ts, {})[param] = val
-    if not rows:
-        return None
-    df = pd.DataFrame([{"datetime": pd.to_datetime(ts), **vals} for ts, vals in rows.items()])
-    return df.sort_values("datetime")
-
-def pick_nearest_index(ts_series: pd.Series, target: datetime) -> int:
-    diffs = (ts_series - target).abs()
-    return int(diffs.idxmin())
-
-def interpolate_at(df: pd.DataFrame, target_utc: datetime, cols: List[str]) -> Tuple[pd.Series, float]:
-    """
-    Interpolate values at target_utc between surrounding timestamps.
-    Returns (row_like_series, age_minutes_from_now; positive means in the past, negative future).
-    """
-    s = df.set_index("datetime").sort_index()
-    now_utc = datetime.now(timezone.utc)
-    age_min = (now_utc - target_utc).total_seconds() / 60.0
-
-    # exact timestamp
-    if target_utc in s.index:
-        return s.loc[target_utc], age_min
-
-    before = s.index[s.index < target_utc]
-    after  = s.index[s.index > target_utc]
-
-    if len(before) and len(after):
-        t0 = before.max(); t1 = after.min()
-        w = (target_utc - t0) / (t1 - t0)
-        row0 = s.loc[t0]; row1 = s.loc[t1]
-        out = {}
-        for c in cols:
-            if c in s.columns:
-                v0 = row0[c]; v1 = row1[c]
-                if pd.notna(v0) and pd.notna(v1):
-                    out[c] = float(v0) * (1 - w) + float(v1) * w
-                else:
-                    out[c] = float(v0) if pd.notna(v0) else (float(v1) if pd.notna(v1) else np.nan)
-        return pd.Series(out), age_min
-
-    # fallback to nearest row
-    nearest_idx = pick_nearest_index(df["datetime"], target_utc)
-    return df.set_index("datetime").iloc[nearest_idx], age_min
-
-# --- main fetch with smart interval & parameter fallbacks ---
-@st.cache_data(show_spinner=True, ttl=15 * 60)
-def fetch_weather_data(lat: float, lon: float, start_utc: datetime, end_utc: datetime,
-                       prefer_fine: bool) -> Optional[pd.DataFrame]:
-    """
-    prefer_fine=True (today): try PT15M first, else PT1H.
-    prefer_fine=False (history/forecast): use PT1H.
-    Falls back if lightning/fresh_snow params aren’t in plan.
-    """
-    base_params: List[str] = [
-        "t_2m:C",                    # air temp (°C)
-        "precip_1h:mm",              # hourly precip (mm)
-        "wind_speed_10m:ms",         # wind (m/s)
-        "relative_humidity_2m:p",    # RH (%)
-        "snow_depth:cm",             # snow on ground (cm)
-        "fresh_snow_1h:cm",          # fresh snow per hour (cm) — may be restricted
-    ]
-    lightning_param = "lightning_strikes_10km_1h:x"
-
-    intervals = ["PT1H"]
-    if prefer_fine:
-        intervals = ["PT15M", "PT1H"]
-
-    # 1) with lightning
-    for itv in intervals:
-        try:
-            df = try_fetch_interval(lat, lon, start_utc, end_utc, itv, base_params + [lightning_param])
-            if df is not None:
-                return df
-        except requests.HTTPError as e:
-            if not (e.response is not None and e.response.status_code in (400, 404)):
-                raise
-
-    # 2) without lightning
-    for itv in intervals:
-        try:
-            df = try_fetch_interval(lat, lon, start_utc, end_utc, itv, base_params)
-            if df is not None:
-                return df
-        except requests.HTTPError as e:
-            if not (e.response is not None and e.response.status_code in (400, 404)):
-                raise
-
-    # 3) drop fresh_snow if still failing
-    safest = [p for p in base_params if p != "fresh_snow_1h:cm"]
-    for itv in intervals:
-        df = try_fetch_interval(lat, lon, start_utc, end_utc, itv, safest)
-        if df is not None:
-            return df
-
-    return None
-
-# --- feels-like (wind-chill / heat-index) ---
-def compute_feels_like(temp_c: float, wind_kmh: float, rh: float) -> float:
-    if temp_c <= 10 and wind_kmh > 4.8:  # Wind chill (Environment Canada)
-        v = wind_kmh
-        feels = 13.12 + 0.6215 * temp_c - 11.37 * (v ** 0.16) + 0.3965 * temp_c * (v ** 0.16)
-    elif temp_c >= 27 and rh >= 40:     # Heat index (NOAA)
-        T, R = temp_c, rh
-        feels = (-8.784695 + 1.61139411*T + 2.338549*R - 0.14611605*T*R
-                 - 0.01230809*(T**2) - 0.01642482*(R**2)
-                 + 0.00221173*(T**2)*R + 0.00072546*T*(R**2)
-                 - 0.000003582*(T**2)*(R**2))
-    else:
-        feels = temp_c
-    return round(feels, 1)
-
-def summarize_weather(df: pd.DataFrame, target_local_mid: datetime, tz_name: Optional[str]) -> Dict:
-    """
-    Summarize daily stats and compute 'current':
-    - Today: interpolate at 'now' (UTC).
-    - Past/Future: interpolate at local noon.
-    Also returns 'freshness_min' for today (how close to now the anchor is).
-    """
-    out: Dict[str, Optional[float]] = {}
-    if df is None or df.empty:
-        return out
-
-    # daily stats
-    if "t_2m:C" in df.columns:
-        out["high_temp"] = round(float(df["t_2m:C"].max()), 1)
-        out["low_temp"]  = round(float(df["t_2m:C"].min()), 1)
-    if "precip_1h:mm" in df.columns:
-        out["rain_total"] = round(float(df["precip_1h:mm"].fillna(0).sum()), 2)
-    if "wind_speed_10m:ms" in df.columns:
-        out["wind_avg"] = round(float(df["wind_speed_10m:ms"].mean() * 3.6), 1)
-    if "relative_humidity_2m:p" in df.columns:
-        out["humidity_avg"] = round(float(df["relative_humidity_2m:p"].mean()), 1)
-    if "fresh_snow_1h:cm" in df.columns:
-        out["snowfall_cm"] = round(float(df["fresh_snow_1h:cm"].fillna(0).sum()), 1)
-    if "snow_depth:cm" in df.columns:
-        out["snow_depth_cm"] = round(float(df["snow_depth:cm"].iloc[-1]), 1)
-
-    # decide anchor time
-    now_loc = datetime.now(ZoneInfo(tz_name)) if tz_name else datetime.now(timezone.utc)
-    is_today = (target_local_mid.date() == now_loc.date())
-    anchor_local = now_loc if is_today else target_local_mid
-    anchor_utc = anchor_local.astimezone(timezone.utc)
-
-    # interpolate/nearest for "current"
-    cols = ["t_2m:C", "wind_speed_10m:ms", "relative_humidity_2m:p"]
-    row_like, age_min = interpolate_at(df, anchor_utc, cols)
-
-    if "t_2m:C" in row_like:
-        out["current_temp"] = round(float(row_like["t_2m:C"]), 1)
-    if "wind_speed_10m:ms" in row_like:
-        out["wind_current"] = round(float(row_like["wind_speed_10m:ms"]) * 3.6, 1)
-    if "relative_humidity_2m:p" in row_like:
-        out["humidity_current"] = round(float(row_like["relative_humidity_2m:p"]), 1)
-
-    # feels-like
-    if set(cols).issubset(row_like.index):
-        out["feels_like"] = compute_feels_like(
-            float(row_like["t_2m:C"]),
-            float(row_like["wind_speed_10m:ms"]) * 3.6,
-            float(row_like["relative_humidity_2m:p"]),
-        )
-
-    # lightning flag
-    out["lightning"] = bool(("lightning_strikes_10km_1h:x" in df.columns) and
-                            (df["lightning_strikes_10km_1h:x"].fillna(0) > 0).any())
-
-    # freshness label (only meaningful for today)
-    out["freshness_min"] = None if not is_today else int(round(abs(age_min)))
-    return out
-
-# ---------- Pull state from Section 1 ----------
-lat = st.session_state["lat"]
-lon = st.session_state["lon"]
-label = st.session_state["label"]
-tz_name = st.session_state["tz_name"]
-local_zone = st.session_state["local_zone"]
-start_utc = st.session_state["start_utc"]
-end_utc = st.session_state["end_utc"]
-prefer_fine = st.session_state["prefer_fine"]
-target_local_mid = st.session_state["target_local_mid"]
-
-# ---------- Fetch & summarize ----------
-st.subheader("Section 2 — Weather Data Summary")
-
-df = fetch_weather_data(lat, lon, start_utc, end_utc, prefer_fine=prefer_fine)
-if df is None or df.empty:
-    st.warning("No weather data available for this location/date (or your account’s access window).")
-    st.stop()
-
-summary = summarize_weather(df, target_local_mid, tz_name)
-
-# Freshness caption for today
-if summary.get("freshness_min") is not None:
-    st.caption(f"🕒 Current values near now (±{summary['freshness_min']} min).")
-
-# --- Metrics UI ---
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("🌡️ Current (°C)", summary.get("current_temp", "—"))
-    st.metric("🌡️ Feels Like (°C)", summary.get("feels_like", "—"))
-with col2:
-    st.metric("❄️ Snowfall (cm)", summary.get("snowfall_cm", "—"))
-    st.metric("🧊 Snow Depth (cm)", summary.get("snow_depth_cm", "—"))
-with col3:
-    st.metric("🌧️ Rain (mm)", summary.get("rain_total", "—"))
-    st.metric("⚡ Lightning", "Yes" if summary.get("lightning", False) else "No")
-
-# Secondary row
-c4, c5, c6 = st.columns(3)
-with c4:
-    st.metric("🌡️ High (°C)", summary.get("high_temp", "—"))
-with c5:
-    st.metric("❄️ Low (°C)", summary.get("low_temp", "—"))
-with c6:
-    st.metric("🌬️ Avg Wind (km/h)", summary.get("wind_avg", "—"))
-
-# Inform if some params weren’t available
-missing_msgs = []
-for p, label_p in [
-    ("fresh_snow_1h:cm", "fresh snow"),
-    ("lightning_strikes_10km_1h:x", "lightning"),
-]:
-    if p not in df.columns:
-        missing_msgs.append(label_p)
-if missing_msgs:
-    st.info(f"{', '.join(missing_msgs).title()} data not included in this account/endpoint — showing other metrics only.")
-
-# --- Hourly (or 15-min) chart(s) ---
-
-# --- Pretty chart + user controls + CSV download ---
-with st.expander("📈 Temperature, rain & snowfall over the day", expanded=True):
-    pretty = {
-        "t_2m:C": "Temperature (°C)",
-        "precip_1h:mm": "Precipitation (mm)",
-        "fresh_snow_1h:cm": "Fresh snow (cm)",
-    }
-
-    available_cols = [c for c in pretty if c in df.columns]
-    if not available_cols:
-        st.info("No time-series fields available for this account/endpoint.")
-    else:
-        # initialize default once
-        if "chart_series" not in st.session_state:
-            default_pick = ["t_2m:C"] if "t_2m:C" in available_cols else [available_cols[0]]
-            st.session_state["chart_series"] = default_pick
-
-        # quick select all / none
-        col_sa, col_sn = st.columns([1,1])
-        with col_sa:
-            if st.button("Select all"):
-                st.session_state["chart_series"] = available_cols
-        with col_sn:
-            if st.button("Clear"):
-                st.session_state["chart_series"] = []
-
-        pick = st.multiselect(
-            "Choose series to display",
-            options=available_cols,
-            default=st.session_state["chart_series"],
-            key="chart_series",  # persist across reruns
-            format_func=lambda k: pretty.get(k, k),
-            help="Select one or more metrics to plot.",
-        )
-
-        if not pick:
-            st.warning("Select at least one series to plot.")
-        else:
-            # Build plotting dataframe with local time
-            df_plot = df[["datetime"] + pick].copy()
-
-            try:
-                tz_name = st.session_state.get("tz_name")
-                if tz_name:
-                    df_plot["datetime_local"] = df_plot["datetime"].dt.tz_convert(ZoneInfo(tz_name))
-                else:
-                    df_plot["datetime_local"] = df_plot["datetime"]
-            except Exception:
-                df_plot["datetime_local"] = df_plot["datetime"]
-
-            rename_map = {k: pretty[k] for k in pick}
-            df_plot = df_plot.rename(columns=rename_map)
-
-            value_vars = [rename_map[k] for k in pick]
-            df_long = df_plot.melt(
-                id_vars=["datetime_local"],
-                value_vars=value_vars,
-                var_name="Series",
-                value_name="Value",
-            )
-
-            import altair as alt
-            chart = (
-                alt.Chart(df_long)
-                .mark_line()
-                .encode(
-                    x=alt.X("datetime_local:T", title="Local time"),
-                    y=alt.Y("Value:Q", title="Value"),
-                    color=alt.Color("Series:N", title="Metric"),
-                    tooltip=[
-                        alt.Tooltip("datetime_local:T", title="Time"),
-                        alt.Tooltip("Series:N", title="Metric"),
-                        alt.Tooltip("Value:Q", title="Value", format=".2f"),
-                    ],
-                )
-                .properties(height=360)
-                .interactive()
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-            # CSV download
-            st.markdown("**Download data**")
-            export_local = st.checkbox("Use local time in CSV", value=True, key="csv_local_time")
-            export_df = (
-                df_plot[["datetime_local"] + value_vars].copy()
-                if export_local
-                else df[["datetime"] + pick].rename(columns=rename_map).rename(columns={"datetime": "datetime_utc"})
-            )
-
-            label_safe = st.session_state.get("label", "location").split(",")[0].replace(" ", "_")
-            day_str = st.session_state.get("target_local_mid").strftime("%Y-%m-%d")
-            fname = f"weather_{label_safe}_{day_str}.csv"
-
-            st.download_button(
-                "⬇️ Download CSV",
-                data=export_df.to_csv(index=False).encode("utf-8"),
-                file_name=fname,
-                mime="text/csv",
-            )
-
 
 
 
@@ -620,7 +247,7 @@ import pickle
 import numpy as np
 import streamlit as st
 
-st.subheader("Section 3 — ML Weather Forecast")
+st.subheader("Weather Forecas for your Event!")
 
 # --- Load the trained model ---
 @st.cache_resource
@@ -628,9 +255,7 @@ def load_model(path: str):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-# Use a relative path instead of a Windows one
-model_path = os.path.join(os.path.dirname(__file__), "XGB_Classifier.pkl")
-model = load_model(model_path)
+model = load_model(r"D:\Oklo_weather_prediction\Models\XGB_Classifier.pkl")
 
 # --- Get month from user or use date ---
 default_month = st.session_state["chosen_date"].month
@@ -644,10 +269,10 @@ lon = st.session_state["lon"]
 future_months = [
     month_input,
     (month_input + 2 - 1) % 12 + 1,
-    (month_input + 4 - 1) % 12 + 1,
-    (month_input + 6 - 1) % 12 + 1
+    (month_input + 4 - 1) % 12 + 1
+    
 ]
-month_labels = ["Current Month", "Next 2 Months", "Next 4 Months", "Next 6 Months"]
+month_labels = ["Current Month", "Next 2 Months", "Next 4 Months"]
 
 # --- Helper: cyclic encode months ---
 def encode_month(m):
@@ -697,32 +322,35 @@ st.divider()
 # =========================
 st.subheader("Section 4 — Smart Recommendations")
 
-current_temp = summary.get("current_temp", None)
-rain_total = summary.get("rain_total", 0)
-pred_next = predictions[1]  # next 2 months prediction
 
-recommendation = ""
 
+# Use the model prediction for the next 2 months
+pred_next = predictions[1] if len(predictions) > 1 else predictions[0]
+
+# --- Generate recommendation based on predicted weather ---
 if pred_next.lower() == "rainy":
-    recommendation = "☔ Expect wetter conditions in the coming months. Prepare rain gear and check local flood advisories."
+    recommendation = (
+        "☔ **Rainy season ahead!** Expect frequent showers. "
+        "Keep an umbrella handy, wear waterproof shoes, and plan indoor activities."
+    )
 elif pred_next.lower() == "snowy":
-    recommendation = "❄️ Snowy conditions predicted — make sure heating and snow equipment are ready."
+    recommendation = (
+        "❄️ **Snowy conditions predicted.** Make sure your heating system is working, "
+        "and check your vehicle’s winter tires if you're traveling."
+    )
 elif pred_next.lower() == "sunny":
-    recommendation = "🌞 Expect mostly sunny conditions — great for outdoor activities and travel."
+    recommendation = (
+        "🌞 **Sunny and clear weather expected!** Ideal for travel, outdoor events, and gardening. "
+        "Remember sunscreen and hydration during hot days."
+    )
+else:
+    recommendation = (
+        "🌤️ **Mixed conditions ahead.** Stay flexible with your plans and check forecasts regularly."
+    )
 
-# Add hint based on API
-if current_temp is not None:
-    if current_temp < 5:
-        recommendation += " It’s currently quite cold — dress warmly."
-    elif current_temp > 25:
-        recommendation += " The current temperature is hot — stay hydrated."
-
-if rain_total and rain_total > 5:
-    recommendation += " Recent rainfall suggests continued moisture in the area."
-
-st.markdown(f"**Recommendation:** {recommendation}")
-
-
+# --- Display the recommendation ---
+st.markdown(f"### 🔍 Recommendation")
+st.write(recommendation)
 
 
 
