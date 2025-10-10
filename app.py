@@ -255,7 +255,7 @@ def load_model(path: str):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-model = load_model(r"D:\Oklo_weather_prediction\Models\XGB_Classifier.pkl")
+model = load_model("XGB_Classifier.pkl")
 
 # --- Get month from user or use date ---
 default_month = st.session_state["chosen_date"].month
@@ -351,6 +351,7 @@ else:
 # --- Display the recommendation ---
 st.markdown(f"### 🔍 Recommendation")
 st.write(recommendation)
+
 
 
 
